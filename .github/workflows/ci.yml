@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [master, 'fix/**', 'feature/**']
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for SonarCloud
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential flex bison pkg-config \
+            libreadline-dev zlib1g-dev libssl-dev libxml2-dev \
+            libicu-dev libxslt1-dev liblz4-dev libzstd-dev \
+            meson ninja-build \
+            perl libperl-dev libipc-run-perl \
+            lcov
+
+      - name: Configure (meson, debug + coverage)
+        run: |
+          meson setup build \
+            --buildtype=debug \
+            -Dcassert=true \
+            -Dtap_tests=enabled \
+            -Dinjection_points=true \
+            -Db_coverage=true
+
+      - name: Build
+        run: ninja -C build -j$(nproc)
+
+      - name: Run regression tests
+        run: meson test -C build --suite setup --suite regress --suite test_spi_func --timeout-multiplier 3
+
+      - name: Generate coverage report
+        if: always()
+        run: |
+          cd build
+          ninja coverage-html 2>/dev/null || true
+          # Generate lcov report for codecov
+          lcov --capture --directory . --output-file coverage.info --ignore-errors mismatch,empty,unused 2>/dev/null || true
+          lcov --remove coverage.info '/usr/*' '*/test/*' --output-file coverage.info 2>/dev/null || true
+
+      - name: Upload to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: build/coverage.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+      - name: SonarCloud Scan
+        if: always()
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: >
+            -Dsonar.organization=irongatelabs
+            -Dsonar.projectKey=IronGateLabs_postgres
+            -Dsonar.sources=src/backend/utils/adt/ri_triggers.c
+            -Dsonar.tests=src/test/modules/test_spi_func
+            -Dsonar.cfamily.compile-commands=build/compile_commands.json
+            -Dsonar.cfamily.gcov.reportsPath=build
