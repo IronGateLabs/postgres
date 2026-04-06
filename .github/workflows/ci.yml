@@ -49,12 +49,13 @@ jobs:
           lcov --capture --directory . --output-file coverage.info --ignore-errors mismatch,empty,unused 2>/dev/null || true
           lcov --remove coverage.info '/usr/*' '*/test/*' --output-file coverage.info 2>/dev/null || true
 
-      - name: Upload to Codecov
+      - name: Upload coverage reports to Codecov
         if: always()
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           files: build/coverage.info
           token: ${{ secrets.CODECOV_TOKEN }}
+          slug: IronGateLabs/postgres
           fail_ci_if_error: false
 
       - name: SonarCloud Scan
