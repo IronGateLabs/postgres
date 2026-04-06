@@ -52,6 +52,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/resowner.h"
 #include "utils/rls.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
@@ -4148,6 +4149,25 @@ ri_FastPathTeardown(void)
 	hash_seq_init(&status, ri_fastpath_cache);
 	while ((entry = hash_seq_search(&status)) != NULL)
 	{
+		ResourceOwner oldowner;
+
+		/*
+		 * First, clear any buffered tuple from the slots.  This must happen
+		 * under the current resource owner because buffer pins from the last
+		 * index scan belong to it.
+		 */
+		if (entry->pk_slot)
+			ExecClearTuple(entry->pk_slot);
+		if (entry->fk_slot)
+			ExecClearTuple(entry->fk_slot);
+
+		/*
+		 * Now switch to CurTransactionResourceOwner for closing relations and
+		 * dropping slots, since that's where their refs were transferred in
+		 * ri_FastPathGetEntry().
+		 */
+		oldowner = CurrentResourceOwner;
+		CurrentResourceOwner = CurTransactionResourceOwner;
 		if (entry->idx_rel)
 			index_close(entry->idx_rel, NoLock);
 		if (entry->pk_rel)
@@ -4156,6 +4176,7 @@ ri_FastPathTeardown(void)
 			ExecDropSingleTupleTableSlot(entry->pk_slot);
 		if (entry->fk_slot)
 			ExecDropSingleTupleTableSlot(entry->fk_slot);
+		CurrentResourceOwner = oldowner;
 		if (entry->flush_cxt)
 			MemoryContextDelete(entry->flush_cxt);
 	}
@@ -4270,6 +4291,44 @@ ri_FastPathGetEntry(const RI_ConstraintInfo *riinfo, Relation fk_rel)
 		 */
 		entry->fk_slot = MakeSingleTupleTableSlot(RelationGetDescr(fk_rel),
 												  &TTSOpsHeapTuple);
+
+		/*
+		 * Transfer relation and TupleDesc references from the current
+		 * resource owner to CurTransactionResourceOwner so they survive
+		 * cleanup of inner resource owners (e.g., SPI portals from C-language
+		 * functions).  The batch callback that closes them
+		 * (ri_FastPathTeardown) fires at query_depth == 0, which may be long
+		 * after the resource owner that was current when the trigger fired
+		 * has been released.
+		 *
+		 * We open relations and create slots under the current resource owner
+		 * (to avoid affecting transient buffer pins from catalog lookups),
+		 * then transfer the relation refs and TupleDesc pins by incrementing
+		 * under the target owner and decrementing under the original.
+		 *
+		 * Relation TupleDescs (rd_att) are reference-counted (tdrefcount >=
+		 * 1), so PinTupleDesc inside table_slot_create /
+		 * MakeSingleTupleTableSlot registers them with the resource owner.
+		 * These must also be transferred.
+		 */
+		if (CurrentResourceOwner != CurTransactionResourceOwner)
+		{
+			ResourceOwner saved = CurrentResourceOwner;
+
+			/* Add refs under CurTransactionResourceOwner */
+			CurrentResourceOwner = CurTransactionResourceOwner;
+			RelationIncrementReferenceCount(entry->pk_rel);
+			RelationIncrementReferenceCount(entry->idx_rel);
+			PinTupleDesc(entry->pk_slot->tts_tupleDescriptor);
+			PinTupleDesc(entry->fk_slot->tts_tupleDescriptor);
+
+			/* Remove refs from the original resource owner */
+			CurrentResourceOwner = saved;
+			RelationDecrementReferenceCount(entry->pk_rel);
+			RelationDecrementReferenceCount(entry->idx_rel);
+			ReleaseTupleDesc(entry->pk_slot->tts_tupleDescriptor);
+			ReleaseTupleDesc(entry->fk_slot->tts_tupleDescriptor);
+		}
 
 		entry->flush_cxt = AllocSetContextCreate(TopTransactionContext,
 												 "RI fast path flush temporary context",

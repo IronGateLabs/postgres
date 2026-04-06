@@ -1,0 +1,65 @@
+--
+-- Test RI fast-path FK check under C-level SPI.
+--
+-- The RI fast-path caches relation references in ri_FastPathGetEntry()
+-- under the current resource owner.  When FK triggers fire inside a
+-- C-level SPI context (SPI_connect/SPI_execute/SPI_finish), the inner
+-- resource owner is released before the batch callback that closes
+-- those relations fires at query_depth == 0.  Without the fix, this
+-- crashes with Assert(rel->rd_refcnt > 0) in index_close.
+--
+-- Simple PL/pgSQL does NOT trigger this because its SPI connection
+-- outlives the batch callback.  A C function using SPI is required.
+--
+
+CREATE EXTENSION test_spi_func;
+
+CREATE TABLE ri_fp_pk1 (id serial PRIMARY KEY);
+CREATE TABLE ri_fp_pk2 (id serial PRIMARY KEY);
+CREATE TABLE ri_fp_pk3 (id serial PRIMARY KEY);
+INSERT INTO ri_fp_pk1 VALUES (1);
+INSERT INTO ri_fp_pk2 VALUES (1);
+INSERT INTO ri_fp_pk3 VALUES (1);
+
+CREATE TABLE ri_fp_fk (
+    id serial PRIMARY KEY,
+    a int REFERENCES ri_fp_pk1(id),
+    b int REFERENCES ri_fp_pk2(id),
+    c int REFERENCES ri_fp_pk3(id),
+    d int REFERENCES ri_fp_pk1(id),
+    e int REFERENCES ri_fp_pk2(id),
+    f int REFERENCES ri_fp_pk3(id)
+);
+
+-- C-level SPI INSERT: the critical test case.
+-- Without the fix this crashes the server.
+SELECT spi_exec(
+    'INSERT INTO ri_fp_fk (a, b, c, d, e, f) VALUES (1, 1, 1, 1, 1, 1)');
+
+-- Additional C-level SPI INSERTs to exercise batch reuse across calls.
+-- Use different column orderings to ensure each is a distinct statement.
+SELECT spi_exec(
+    'INSERT INTO ri_fp_fk (f, e, d, c, b, a) VALUES (1, 1, 1, 1, 1, 1)');
+SELECT spi_exec(
+    'INSERT INTO ri_fp_fk (a, c, e, b, d, f) VALUES (1, 1, 1, 1, 1, 1)');
+
+-- C-level SPI with FK violation: should error, not crash
+SELECT spi_exec(
+    'INSERT INTO ri_fp_fk (a, b, c, d, e, f) VALUES (999, 1, 1, 1, 1, 1)');
+
+-- Nested: PL/pgSQL calling C SPI (mimics PostGIS toTopoGeom pattern)
+CREATE FUNCTION plpgsql_calls_c_spi() RETURNS void AS $$
+DECLARE
+    ins_stmt text := 'INSERT INTO ri_fp_fk (a, b, c, d, e, f) VALUES (1, 1, 1, 1, 1, 1)';
+BEGIN
+    PERFORM spi_exec(ins_stmt);
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT plpgsql_calls_c_spi();
+
+-- Cleanup
+DROP FUNCTION plpgsql_calls_c_spi();
+DROP TABLE ri_fp_fk;
+DROP TABLE ri_fp_pk3, ri_fp_pk2, ri_fp_pk1;
+DROP EXTENSION test_spi_func;
