@@ -1,0 +1,4 @@
+comment = 'Test SQL-callable C function that uses SPI'
+default_version = '1.0'
+module_pathname = '$libdir/test_spi_func'
+relocatable = true
