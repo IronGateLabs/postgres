@@ -39,6 +39,7 @@
 #include "commands/event_trigger.h"
 #include "commands/explain_state.h"
 #include "commands/prepare.h"
+#include "commands/repack.h"
 #include "common/pg_prng.h"
 #include "jit/jit.h"
 #include "libpq/libpq.h"
@@ -3577,6 +3578,9 @@ ProcessInterrupts(void)
 
 	if (ParallelApplyMessagePending)
 		ProcessParallelApplyMessages();
+
+	if (RepackMessagePending)
+		ProcessRepackMessages();
 }
 
 /*
